@@ -437,6 +437,28 @@ psql "$DATABASE_URL" -f ESQUEMA-POSTGRES.sql
 psql "$DATABASE_URL" -1 -f carga.sql
 ```
 
+El destino es un **módulo del SaaS RECYLINK**: los usuarios entran por la
+plataforma y cada cliente ve solo su versión de la herramienta. Eso cambia algo
+de fondo respecto de hoy, y no es solo una columna más:
+
+- Hoy `EMPRESA` es una **constante del deploy** (`lib/instance.js`, `"NEXT"`) y
+  cada cliente tiene su instancia y su planilla. En RECYLINK es una **fila**, y
+  las de todos los clientes conviven en la misma base.
+- Por eso toda tabla de datos lleva `empresa_id` —incluso las que podrían
+  deducirlo por FK— y las FK son **compuestas**: `medidor` referencia
+  `(empresa_id, sucursal_id)`. Así la base rechaza un medidor cuya empresa no
+  sea la de su sucursal, en vez de confiar en que la app no se equivoque.
+- Las claves heredadas de la planilla (`legacy_id`) son únicas **por empresa**:
+  dos clientes migrados de planillas distintas pueden traer el mismo `comb_...`.
+- El aislamiento efectivo es RLS con `app.empresa_id` (sección 10 del esquema,
+  comentada). Si RECYLINK no usa RLS, el filtro pasa a la capa de datos — y ahí
+  el requisito es que **una** función lo ponga siempre, porque la consulta que
+  se olvide no falla: devuelve datos de otro cliente.
+- Los catálogos (subcategorías, proveedores, factores, refrigerantes) quedan
+  **compartidos** entre clientes. Es una decisión con una consecuencia anotada
+  en la sección 2 del esquema: el slug de una subcategoría que cree un cliente
+  es legible por los demás si alguna consulta lista el catálogo completo.
+
 Qué cambia al pasar, contra las "Deudas del modelo" de arriba:
 
 - **La sucursal se referencia solo por FK.** El nombre pasa a ser un `UNIQUE`

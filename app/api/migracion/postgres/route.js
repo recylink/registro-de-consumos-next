@@ -127,10 +127,13 @@ function slug(s) {
 const EMP = `(SELECT id FROM empresa WHERE codigo = ${q(EMPRESA)})`;
 const suc = (nombre) =>
   `(SELECT id FROM sucursal WHERE empresa_id = ${EMP} AND nombre = ${q(nombre)})`;
+// Los subselects por clave heredada van acotados por empresa: `legacy_id` y
+// `drive_file_id` son únicos POR empresa, no globales, porque en RECYLINK
+// conviven los datos de todos los clientes en la misma base.
 const sucPorLegacy = (legacyId) =>
-  `(SELECT id FROM sucursal WHERE legacy_id = ${q(legacyId)})`;
+  `(SELECT id FROM sucursal WHERE empresa_id = ${EMP} AND legacy_id = ${q(legacyId)})`;
 const arch = (fileId) =>
-  `(SELECT id FROM archivo_drive WHERE drive_file_id = ${q(fileId)})`;
+  `(SELECT id FROM archivo_drive WHERE empresa_id = ${EMP} AND drive_file_id = ${q(fileId)})`;
 const prov = (tipo, nombre) =>
   nombre
     ? `(SELECT id FROM proveedor WHERE tipo_consumo = '${tipo}' AND slug = ${q(slug(nombre))})`
@@ -281,8 +284,8 @@ export async function GET(req) {
         const nombreProv = sc.proveedor === "otro" ? sc.proveedorCustom : sc.proveedor;
         nSubcatFilas++;
         c(
-          `INSERT INTO sucursal_subcategoria (sucursal_id, tipo_consumo, subcategoria_id, proveedor_id, unidad, num_cliente, sistema_electrico, uso, activa, legacy_id) VALUES (` +
-            `${suc(s.nombre)}, '${tipo}', ${scId ? subcat(tipo, scId, sc.tipoCustom) : "NULL"}, ` +
+          `INSERT INTO sucursal_subcategoria (empresa_id, sucursal_id, tipo_consumo, subcategoria_id, proveedor_id, unidad, num_cliente, sistema_electrico, uso, activa, legacy_id) VALUES (` +
+            `${EMP}, ${suc(s.nombre)}, '${tipo}', ${scId ? subcat(tipo, scId, sc.tipoCustom) : "NULL"}, ` +
             `${proveedor(tipo, nombreProv)}, ${unidad(sc.unidad)}, ${q(sc.numCliente)}, ` +
             `${q(sc.sistemaElectrico)}, ${q(sc.uso)}, true, ${q(sc.id)});`,
         );
@@ -348,16 +351,18 @@ export async function GET(req) {
     }
     medidoresEmitidos.add(m.id);
     c(
-      `INSERT INTO medidor (sucursal_id, tipo_consumo, nombre, numero, activo, facturable, legacy_id) VALUES (` +
-        `${refSuc}, ${enumOf(m.type, TIPOS)}, ${q(m.nombre || m.id)}, ${q(m.numero)}, ` +
+      `INSERT INTO medidor (empresa_id, sucursal_id, tipo_consumo, nombre, numero, activo, facturable, legacy_id) VALUES (` +
+        `${EMP}, ${refSuc}, ${enumOf(m.type, TIPOS)}, ${q(m.nombre || m.id)}, ${q(m.numero)}, ` +
         `${bool(m.activo)}, ${bool(m.facturable)}, ${q(m.id)});`,
     );
   }
 
-  const med = (legacyId) => `(SELECT id FROM medidor WHERE legacy_id = ${q(legacyId)})`;
+  const med = (legacyId) =>
+    `(SELECT id FROM medidor WHERE empresa_id = ${EMP} AND legacy_id = ${q(legacyId)})`;
   const lect = (meterId, periodo) =>
     `(SELECT lm.id FROM lectura_medidor lm JOIN medidor m ON m.id = lm.medidor_id` +
-    ` WHERE m.legacy_id = ${q(meterId)} AND lm.periodo = ${q(periodo)})`;
+    ` WHERE m.empresa_id = ${EMP} AND m.legacy_id = ${q(meterId)}` +
+    ` AND lm.periodo = ${q(periodo)})`;
 
   // Una fila de `Lecturas Medidor` puede traer solo adjuntos, solo lectura, o
   // las dos cosas, y la app las parte en `readings` y `docs`. Acá se vuelven a
@@ -389,8 +394,8 @@ export async function GET(req) {
       continue;
     }
     c(
-      `INSERT INTO lectura_medidor (medidor_id, periodo, lectura) VALUES (` +
-        `${med(l.meterId)}, ${q(l.periodo)}, ${n(l.lectura)});`,
+      `INSERT INTO lectura_medidor (empresa_id, medidor_id, periodo, lectura) VALUES (` +
+        `${EMP}, ${med(l.meterId)}, ${q(l.periodo)}, ${n(l.lectura)});`,
     );
   }
 
@@ -406,8 +411,8 @@ export async function GET(req) {
       if (!refArch) continue;
       nAdjuntos++;
       c(
-        `INSERT INTO lectura_adjunto (lectura_medidor_id, rol, archivo_id) VALUES (` +
-          `${lect(meterId, periodo)}, '${rol}', ${refArch});`,
+        `INSERT INTO lectura_adjunto (empresa_id, lectura_medidor_id, rol, archivo_id) VALUES (` +
+          `${EMP}, ${lect(meterId, periodo)}, '${rol}', ${refArch});`,
       );
     }
   }
@@ -422,8 +427,8 @@ export async function GET(req) {
       continue;
     }
     c(
-      `INSERT INTO precio_periodo (sucursal_id, tipo_consumo, periodo, precio) VALUES (` +
-        `${refSuc}, ${tipo}, ${q(p.month)}, ${n(p.precio)});`,
+      `INSERT INTO precio_periodo (empresa_id, sucursal_id, tipo_consumo, periodo, precio) VALUES (` +
+        `${EMP}, ${refSuc}, ${tipo}, ${q(p.month)}, ${n(p.precio)});`,
     );
   }
 
@@ -456,8 +461,8 @@ export async function GET(req) {
         continue;
       }
       c(
-        `INSERT INTO factor_emision_sucursal (sucursal_id, factor_emision_id, valor, pending_review) VALUES (` +
-          `${sucPorLegacy(sucId)}, ${q(key)}, ${n(v.value)}, ${bool(v.pendingReview)});`,
+        `INSERT INTO factor_emision_sucursal (empresa_id, sucursal_id, factor_emision_id, valor, pending_review) VALUES (` +
+          `${EMP}, ${sucPorLegacy(sucId)}, ${q(key)}, ${n(v.value)}, ${bool(v.pendingReview)});`,
       );
     }
   }
@@ -475,8 +480,8 @@ export async function GET(req) {
         continue;
       }
       c(
-        `INSERT INTO refrigerante_carga (sucursal_id, refrigerante_gas_id, periodo, carga_kg) VALUES (` +
-          `${sucPorLegacy(sucId)}, ${q(rf.tipo)}, ${q(rf.mes)}, ${n(rf.cargaKg)});`,
+        `INSERT INTO refrigerante_carga (empresa_id, sucursal_id, refrigerante_gas_id, periodo, carga_kg) VALUES (` +
+          `${EMP}, ${sucPorLegacy(sucId)}, ${q(rf.tipo)}, ${q(rf.mes)}, ${n(rf.cargaKg)});`,
       );
     }
   }
@@ -506,8 +511,8 @@ export async function GET(req) {
     c(`\n-- meta_sucursal`);
     for (const [sucId, m] of metasSuc) {
       c(
-        `INSERT INTO meta_sucursal (sucursal_id, ${metaCols}) VALUES (` +
-          `${sucPorLegacy(sucId)}, ${metaValores(m)});`,
+        `INSERT INTO meta_sucursal (sucursal_id, empresa_id, ${metaCols}) VALUES (` +
+          `${sucPorLegacy(sucId)}, ${EMP}, ${metaValores(m)});`,
       );
     }
   }
@@ -625,8 +630,16 @@ export async function GET(req) {
   if (avisos.length) w(`-- AVISOS: ${avisos.length}. Verlos con ?informe=si ANTES de aplicar.`);
   w(`\nBEGIN;\n`);
 
-  seccion("Empresa");
-  w(`INSERT INTO empresa (codigo, nombre) VALUES (${q(EMPRESA)}, ${q(EMPRESA)});`);
+  seccion("Empresa (el tenant)");
+  w(`-- ON CONFLICT porque en RECYLINK la base es una y los clientes muchos:`);
+  w(`-- este volcado se corre una vez por instancia y todos caen en la misma`);
+  w(`-- base. Si la empresa ya está, se reusa su fila.`);
+  w(
+    `INSERT INTO empresa (codigo, nombre) VALUES (${q(EMPRESA)}, ${q(EMPRESA)}) ` +
+      `ON CONFLICT (codigo) DO NOTHING;`,
+  );
+  w(`-- Falta ligarla al cliente de RECYLINK, que este código no conoce:`);
+  w(`--   UPDATE empresa SET recylink_tenant_id = '<uuid>' WHERE codigo = ${q(EMPRESA)};`);
 
   seccion("Catalogos (hoy en lib/domain/, aca filas)");
   for (const [id, s] of subcats) {
@@ -675,8 +688,8 @@ export async function GET(req) {
   w(`-- columna es NOT NULL UNIQUE y las hojas de registro no guardan el File ID.`);
   for (const [fileId, a] of archivos) {
     w(
-      `INSERT INTO archivo_drive (drive_file_id, url, nombre) VALUES (` +
-        `${q(fileId)}, ${q(a.url)}, ${q(a.nombre)});`,
+      `INSERT INTO archivo_drive (empresa_id, drive_file_id, url, nombre) VALUES (` +
+        `${EMP}, ${q(fileId)}, ${q(a.url)}, ${q(a.nombre)});`,
     );
   }
 
