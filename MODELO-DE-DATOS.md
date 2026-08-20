@@ -16,6 +16,12 @@ con un mensaje (`lib/sheets/encabezados.js`).
 
 ## Dónde viven los datos
 
+> **Ojo con esta sección.** Describe la planilla, que fue el único almacén hasta
+> la migración. Hoy hay una base PostgreSQL instalada y con datos, y el
+> interruptor `DATOS_BACKEND=postgres` decide cuál de las dos se usa. Los
+> diagramas de PostgreSQL están más abajo; esta parte y las "Hojas" siguen
+> valiendo para el modo planilla y para entender de dónde viene cada tabla.
+
 No hay base de datos. Hay tres almacenes:
 
 | Almacén | Qué guarda | Acceso |
@@ -36,7 +42,371 @@ Consecuencias del sustrato, porque explican casi todas las decisiones de abajo:
 - **La cuota de la API de Sheets es de 60 lecturas por minuto**, así que las
   lecturas están cacheadas por etiqueta y no se lee "en cada render".
 
-## Diagrama
+## Diagrama — PostgreSQL, lo central
+
+Las tablas que se tocan todos los días. Generado desde el esquema real
+(`ESQUEMA-POSTGRES.sql`), no a mano.
+
+```mermaid
+erDiagram
+    empresa       ||--o{ sucursal              : "tiene"
+    sucursal      ||--o{ sucursal_subcategoria : "qué mide, y cómo"
+    sucursal      ||--o{ registro_consumo      : "consume"
+    sucursal      ||--o{ medidor               : "tiene"
+    medidor       ||--o{ lectura_medidor       : "se lee cada mes"
+    tipo_consumo  ||--o{ registro_consumo      : "clasifica"
+    proveedor     ||--o{ registro_consumo      : "factura"
+    archivo_drive ||--o| registro_consumo      : "respalda"
+
+    empresa {
+        uuid id PK
+        uuid holding_id FK
+        text codigo "NEXT"
+        text nombre
+    }
+    sucursal {
+        uuid id PK
+        uuid empresa_id FK
+        text nombre
+        boolean activa "baja lógica, no DELETE"
+    }
+    sucursal_subcategoria {
+        uuid id PK
+        uuid sucursal_id FK
+        text tipo_consumo FK
+        text subcategoria_id FK
+        uuid proveedor_id FK
+        text num_cliente
+        boolean activa
+    }
+    registro_consumo {
+        uuid id PK
+        uuid sucursal_id FK
+        text tipo_consumo FK
+        text subcategoria_id FK
+        text refrigerante_gas_id FK "solo refrigerantes"
+        uuid archivo_id FK
+        date fecha
+        char periodo "generada desde fecha"
+        numeric consumo
+        numeric costo
+        enum estado "activa, eliminada"
+        enum origen "manual, documento, foto, sheets"
+    }
+    medidor {
+        uuid id PK
+        uuid sucursal_id FK
+        text tipo_consumo FK
+        text nombre
+        text numero
+        boolean facturable
+    }
+    lectura_medidor {
+        uuid id PK
+        uuid medidor_id FK
+        char periodo "YYYY-MM"
+        numeric lectura
+    }
+    tipo_consumo {
+        text id PK "electricidad, combustible, agua, refrigerantes"
+        text label
+        enum unidad_default
+        boolean activo
+    }
+    proveedor {
+        uuid id PK
+        text slug
+        text nombre
+        text tipo_consumo FK
+    }
+    archivo_drive {
+        uuid id PK
+        text drive_file_id
+        text url
+        text nombre
+    }
+```
+
+Tres cosas que el diagrama dice y conviene no pasar por alto:
+
+- **`tipo_consumo` es una tabla, no un ENUM.** Agregar un tipo nuevo es un
+  `INSERT`, no una migración. Ver `PLAYBOOK-NUEVO-TIPO.md`.
+- **Los refrigerantes viven en `registro_consumo`**, como cualquier otro
+  consumo, con su gas en `refrigerante_gas_id`. La tabla `refrigerante_carga`
+  que existió en el primer borrador ya no está.
+- **`periodo` es una columna generada** desde `fecha`. Nadie la escribe, y por
+  eso no puede desalinearse.
+
+## Diagrama — PostgreSQL, las 24 tablas
+
+Todo el esquema. Denso a propósito: es para consultar, no para explicar. Se
+omiten `created_at` y `updated_at`, que están en casi todas.
+
+```mermaid
+erDiagram
+    holding          ||--o{ empresa                 : "agrupa"
+    empresa          ||--o{ sucursal                : "tiene"
+    empresa          ||--o{ registro_consumo        : "tiene"
+    empresa          ||--o{ archivo_drive           : "tiene"
+    empresa          ||--o{ drive_carpeta           : "tiene"
+    empresa          ||--o{ app_config              : "tiene"
+    empresa          ||--o{ foto                    : "tiene"
+    empresa          ||--o{ foto_notif_email        : "tiene"
+    empresa          ||--o| meta_empresa            : "tiene"
+    empresa          ||--o{ factor_emision_empresa  : "tiene"
+    sucursal         ||--o{ sucursal_subcategoria   : "tiene"
+    sucursal         ||--o{ registro_consumo        : "tiene"
+    sucursal         ||--o{ medidor                 : "tiene"
+    sucursal         ||--o{ precio_periodo          : "tiene"
+    sucursal         ||--o{ foto                    : "tiene"
+    sucursal         ||--o| meta_sucursal           : "tiene"
+    sucursal         ||--o{ factor_emision_sucursal : "tiene"
+    medidor          ||--o{ lectura_medidor         : "se lee cada mes"
+    lectura_medidor  ||--o{ lectura_adjunto         : "adjunta"
+    archivo_drive    ||--o{ lectura_adjunto         : "respalda"
+    archivo_drive    ||--o{ registro_consumo        : "respalda"
+    archivo_drive    ||--o{ foto                    : "respalda"
+    registro_consumo ||--o| foto                    : "al completarse"
+    tipo_consumo     ||--o{ subcategoria            : "clasifica"
+    tipo_consumo     ||--o{ proveedor               : "clasifica"
+    tipo_consumo     ||--o{ registro_consumo        : "clasifica"
+    tipo_consumo     ||--o{ medidor                 : "clasifica"
+    tipo_consumo     ||--o{ precio_periodo          : "clasifica"
+    tipo_consumo     ||--o{ sucursal_subcategoria   : "clasifica"
+    tipo_consumo     ||--o{ foto                    : "clasifica"
+    tipo_consumo     ||--o{ drive_carpeta           : "clasifica"
+    tipo_consumo     ||--o{ factor_emision          : "clasifica"
+    subcategoria     ||--o{ subcategoria_unidad     : "detalla"
+    subcategoria     ||--o{ registro_consumo        : "detalla"
+    subcategoria     ||--o{ sucursal_subcategoria   : "detalla"
+    subcategoria     ||--o{ foto                    : "detalla"
+    subcategoria     ||--o{ factor_emision          : "detalla"
+    proveedor        ||--o{ registro_consumo        : "aparece en"
+    proveedor        ||--o{ sucursal_subcategoria   : "aparece en"
+    proveedor        ||--o{ foto                    : "aparece en"
+    proveedor        ||--o{ drive_carpeta           : "aparece en"
+    refrigerante_gas ||--o{ registro_consumo        : "identifica"
+    factor_emision   ||--o{ factor_emision_empresa  : "se aplica en"
+    factor_emision   ||--o{ factor_emision_sucursal : "se aplica en"
+
+    holding {
+        uuid id PK
+        text nombre
+        uuid recylink_holding_id "proyección de RECYLINK"
+    }
+    empresa {
+        uuid id PK
+        uuid holding_id FK
+        text codigo
+        text nombre
+        uuid recylink_empresa_id
+        boolean activa
+    }
+    sucursal {
+        uuid id PK
+        uuid empresa_id FK
+        text nombre
+        text direccion
+        boolean activa
+        uuid recylink_sucursal_id
+        text legacy_id "id de la planilla"
+    }
+    sucursal_subcategoria {
+        uuid id PK
+        uuid empresa_id FK
+        uuid sucursal_id FK
+        text tipo_consumo FK
+        text subcategoria_id FK
+        uuid proveedor_id FK
+        enum unidad
+        text num_cliente
+        text sistema_electrico
+        text uso
+        boolean activa
+        text legacy_id
+    }
+    registro_consumo {
+        uuid id PK
+        uuid empresa_id FK
+        uuid sucursal_id FK
+        text tipo_consumo FK
+        text subcategoria_id FK
+        uuid proveedor_id FK
+        text refrigerante_gas_id FK
+        uuid archivo_id FK
+        text num_cliente
+        date fecha
+        char periodo "generada"
+        numeric consumo
+        enum unidad
+        numeric costo
+        enum estado
+        enum origen
+        uuid creado_por
+        text legacy_id
+    }
+    medidor {
+        uuid id PK
+        uuid empresa_id FK
+        uuid sucursal_id FK
+        text tipo_consumo FK
+        text nombre
+        text numero
+        boolean activo
+        boolean facturable
+        text legacy_id
+    }
+    lectura_medidor {
+        uuid id PK
+        uuid empresa_id FK
+        uuid medidor_id FK
+        char periodo
+        numeric lectura
+        uuid creado_por
+        text legacy_id
+    }
+    lectura_adjunto {
+        uuid id PK
+        uuid empresa_id FK
+        uuid lectura_medidor_id FK
+        uuid archivo_id FK
+        enum rol "factura, pago, respaldo"
+    }
+    precio_periodo {
+        uuid id PK
+        uuid empresa_id FK
+        uuid sucursal_id FK
+        text tipo_consumo FK
+        char periodo
+        numeric precio
+    }
+    foto {
+        uuid id PK
+        uuid empresa_id FK
+        uuid archivo_id FK
+        uuid sucursal_id FK
+        uuid registro_id FK
+        text tipo_consumo FK
+        text subcategoria_id FK
+        uuid proveedor_id FK
+        char periodo
+        enum status "pendiente, procesada"
+        numeric consumo
+        enum unidad
+        numeric costo
+        text notas
+        uuid completada_por
+    }
+    archivo_drive {
+        uuid id PK
+        uuid empresa_id FK
+        text drive_file_id
+        text url
+        text nombre
+        text mime_type
+    }
+    drive_carpeta {
+        uuid id PK
+        uuid empresa_id FK
+        enum rol
+        text tipo_consumo FK
+        uuid proveedor_id FK
+        text folder_id
+    }
+    tipo_consumo {
+        text id PK
+        text label
+        enum unidad_default
+        smallint orden
+        boolean activo
+    }
+    subcategoria {
+        text id PK
+        text tipo_consumo FK
+        text label
+        enum origen "catalogo, otro"
+        enum unidad_default
+    }
+    subcategoria_unidad {
+        text subcategoria_id FK
+        enum unidad
+    }
+    proveedor {
+        uuid id PK
+        text slug
+        text nombre
+        text tipo_consumo FK
+    }
+    refrigerante_gas {
+        text id PK "r404a, r507, ..."
+        text label
+        numeric gwp_ar5
+    }
+    factor_emision {
+        text id PK
+        text label
+        text unidad
+        smallint alcance "1, 2 o 3"
+        text tipo_consumo FK
+        text subcategoria_id FK
+        text fuente
+    }
+    factor_emision_empresa {
+        uuid empresa_id FK
+        text factor_emision_id FK
+        numeric valor
+    }
+    factor_emision_sucursal {
+        uuid empresa_id FK
+        uuid sucursal_id FK
+        text factor_emision_id FK
+        numeric valor
+        boolean pending_review
+    }
+    meta_empresa {
+        uuid empresa_id PK
+        numeric absoluta
+        numeric relativa
+        smallint anio_base
+        numeric base_emissions
+        enum base_mode
+    }
+    meta_sucursal {
+        uuid sucursal_id PK
+        uuid empresa_id FK
+        numeric absoluta
+        numeric relativa
+        smallint anio_base
+        numeric base_emissions
+        enum base_mode
+    }
+    foto_notif_email {
+        uuid empresa_id FK
+        text email
+    }
+    app_config {
+        uuid empresa_id FK
+        text clave
+        jsonb valor
+    }
+```
+
+Lo que el diagrama **no** puede mostrar, y está en `ESQUEMA-POSTGRES.sql`:
+
+- Las claves foráneas hacia `sucursal`, `registro_consumo`, `archivo_drive` y
+  `lectura_medidor` son **compuestas**: van por `(empresa_id, id)`, no por `id`
+  solo. Es lo que impide que una fila de una empresa apunte a la de otra.
+- El **índice único parcial contra el doble conteo**, solo para electricidad y
+  agua. Combustible queda fuera porque se registra por compra.
+- Las **políticas RLS**, en `ESQUEMA-POSTGRES-RLS.sql`, con el alcance en tres
+  niveles.
+
+## Diagrama — la planilla (histórico)
+
+> Así estaban los datos antes de la migración, y así siguen mientras
+> `DATOS_BACKEND` no diga `postgres`. Se conserva porque explica el origen de
+> cada tabla de arriba: las relaciones eran **por nombre**, no por id, y ninguna
+> estaba declarada en ningún lado.
 
 ```mermaid
 erDiagram
