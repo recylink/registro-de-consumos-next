@@ -19,9 +19,10 @@ export function AvisoDatos({ configured, error }) {
       <div className="rc-banner warning" role="status">
         <Icon name="warning" size={16} />
         <span>
-          Esta instancia todavía no tiene backend configurado (falta{" "}
-          <code>APPS_SCRIPT_URL</code>), así que las pantallas se ven vacías y no
-          se guarda nada.
+          Esta instancia todavía no tiene de dónde sacar los datos: falta
+          configurar la base (<code>DATABASE_URL</code>) o la planilla (las
+          credenciales de Google). Las pantallas se ven vacías y no se guarda
+          nada.
         </span>
       </div>
     );

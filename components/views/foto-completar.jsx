@@ -58,7 +58,7 @@ export function FotoCompletar({ row, sucursales, mesActual }) {
     toast.info("Procesando foto…", "Guardando datos y moviendo archivo.");
 
     const res = await completeFotoAction({
-      rowIndex: row.rowIndex,
+      id: row.id,
       fotoRow: {
         ...row,
         tipo: datos.tipo,

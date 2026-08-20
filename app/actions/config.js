@@ -3,11 +3,11 @@
 import { revalidateTag } from "next/cache";
 import { TAGS } from "@/lib/apps-script";
 import { run } from "@/lib/result";
-import { deleteSucursal, upsertSucursal, writeSucursales } from "@/lib/sheets/sucursales";
-import { upsertEmissions } from "@/lib/sheets/emissions";
+import {
+  deleteSucursal, renameSucursalInRecords, upsertEmissions, upsertSucursal,
+  writeFotoNotifEmails, writeSucursales,
+} from "@/lib/backend";
 import { patchEmisionesVacio, resumenPatchEmisiones } from "@/lib/domain/emisiones-patch";
-import { writeFotoNotifEmails } from "@/lib/sheets/config-store";
-import { renameSucursalInRecords } from "@/lib/sheets/records";
 
 /**
  * Guarda una sola sucursal. Es la vía normal: no pisa lo que otra sesión haya

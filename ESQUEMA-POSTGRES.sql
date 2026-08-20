@@ -2,7 +2,8 @@
 -- Registro de Consumos — esquema relacional PostgreSQL
 -- Derivado de MODELO-DE-DATOS.md (once hojas de Google Sheets).
 --
--- Requiere PostgreSQL 13+ (gen_random_uuid vía pgcrypto).
+-- Requiere PostgreSQL 13+: `gen_random_uuid()` es del core desde esa versión,
+-- así que no hace falta la extensión pgcrypto (pedirla rompe donde no está).
 -- Convención: snake_case, singular en tablas, PK `id`, FK `<tabla>_id`.
 --
 -- Las siete "deudas del modelo" del documento se resuelven acá:
@@ -24,9 +25,11 @@
 --
 -- Cómo se garantiza, y por qué así:
 --
--- 1. `empresa` es el tenant. Si RECYLINK ya tiene una tabla de clientes,
---    `empresa.recylink_tenant_id` la referencia y esta tabla queda como
---    proyección local; si no, es la tabla de tenants.
+-- 1. La jerarquía es holding → empresa → sucursal, la misma que ya tiene
+--    RECYLINK, y los tres niveles son PROYECCIÓN de los suyos: cada tabla
+--    lleva su `recylink_*_id`. El tenant de los DATOS sigue siendo `empresa`;
+--    `holding` existe para poder resolver "todas las empresas de este
+--    holding" sin preguntárselo a RECYLINK en cada consulta.
 -- 2. TODA tabla de datos lleva `empresa_id`, incluso las que podrían
 --    deducirlo por FK. Es redundante a propósito: sin la columna, una
 --    política de aislamiento necesita un JOIN de tres niveles para saber de
@@ -39,11 +42,15 @@
 -- 4. Las claves naturales heredadas de la planilla (`legacy_id`) son únicas
 --    POR empresa, no globales: dos clientes migrados desde planillas
 --    distintas pueden tener el mismo `comb_...`.
--- 5. El aislamiento efectivo se activa al final del archivo (sección 10):
---    RLS con `app.empresa_id`. Si RECYLINK no usa RLS, esa sección se omite
---    y el filtro pasa a ser responsabilidad de la capa de datos — pero
---    entonces es UNA función la que tiene que ponerlo siempre, no cada
---    consulta.
+-- 5. El aislamiento efectivo vive en ESQUEMA-POSTGRES-RLS.sql, que se aplica
+--    después de cargar los datos. Lo que ese archivo implementa no es un
+--    tenant sino un ALCANCE, y la diferencia importa: un usuario de nivel
+--    holding ve VARIAS empresas a la vez, así que el alcance es un conjunto
+--    de empresas más, opcionalmente, un subconjunto de sucursales. Por eso
+--    son dos ajustes de sesión y no uno.
+--    Si RECYLINK no usa RLS, ese archivo no se aplica y el filtro pasa a ser
+--    responsabilidad de la capa de datos — pero entonces es UNA función la
+--    que tiene que ponerlo siempre, no cada consulta.
 --
 -- Los catálogos (`subcategoria`, `proveedor`, `factor_emision`,
 -- `refrigerante_gas`) son COMPARTIDOS entre clientes, sin `empresa_id`.
@@ -57,8 +64,6 @@
 --     FOREIGN KEY (creado_por) REFERENCES <tabla_de_usuarios> (id);
 -- =====================================================================
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 -- ---------------------------------------------------------------------
 -- Dominios y tipos
 -- ---------------------------------------------------------------------
@@ -66,10 +71,6 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- Período mensual "YYYY-MM", igual que en la planilla.
 CREATE DOMAIN periodo_mes AS char(7)
   CHECK (VALUE ~ '^[0-9]{4}-(0[1-9]|1[0-2])$');
-
-CREATE TYPE tipo_consumo AS ENUM (
-  'electricidad', 'combustible', 'agua', 'refrigerantes'
-);
 
 CREATE TYPE unidad_medida AS ENUM (
   'kWh', 'L', 'gal', 'm3', 'kg', 't'
@@ -109,25 +110,47 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =====================================================================
--- 1. El tenant
+-- 1. La jerarquía: holding → empresa → sucursal
+--
+-- Los tres niveles ya existen en RECYLINK y un usuario está en UNO solo.
+-- Estas tablas son proyección local de las suyas, no la fuente: por eso cada
+-- una lleva un `recylink_*_id` sin FK todavía. Cuando se conozca la tabla del
+-- otro lado es una línea por columna.
 -- =====================================================================
 
--- La columna `Empresa` de las hojas era un discriminante de instancia
--- (constante EMPRESA en lib/instance.js, "NEXT"). Acá es una fila, y es el
--- tenant: todo lo demás cuelga de ella.
-CREATE TABLE empresa (
-  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  codigo             text NOT NULL,     -- 'NEXT': el valor que quedó escrito en la planilla
-  nombre             text NOT NULL,
-  -- El cliente en RECYLINK. Queda sin FK hasta conocer esa tabla; cuando se
-  -- conozca, es una línea y esta tabla pasa a ser proyección de aquella.
-  recylink_tenant_id uuid,
-  activa             boolean NOT NULL DEFAULT true,
-  created_at         timestamptz NOT NULL DEFAULT now(),
-  updated_at         timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT empresa_codigo_key   UNIQUE (codigo),
-  CONSTRAINT empresa_recylink_key UNIQUE (recylink_tenant_id)
+-- El nivel de arriba. No cuelga ningún dato de él: existe para poder
+-- responder "qué empresas ve un usuario de holding" con una sola consulta.
+CREATE TABLE holding (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  nombre              text NOT NULL,
+  recylink_holding_id uuid,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  updated_at          timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT holding_recylink_key UNIQUE (recylink_holding_id)
 );
+
+CREATE TRIGGER holding_set_updated_at BEFORE UPDATE ON holding
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- La columna `Empresa` de las hojas era un discriminante de instancia
+-- (constante EMPRESA en lib/instance.js, "NEXT"). Aquí es una fila, y es el
+-- tenant de los datos: todo lo demás cuelga de ella.
+CREATE TABLE empresa (
+  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- NULL = empresa suelta, sin holding. Es el caso de la planilla actual.
+  holding_id          uuid REFERENCES holding (id) ON DELETE SET NULL,
+  codigo              text NOT NULL,    -- 'NEXT': el valor que quedó escrito en la planilla
+  nombre              text NOT NULL,
+  recylink_empresa_id uuid,
+  activa              boolean NOT NULL DEFAULT true,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  updated_at          timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT empresa_codigo_key   UNIQUE (codigo),
+  CONSTRAINT empresa_recylink_key UNIQUE (recylink_empresa_id)
+);
+
+-- El alcance de un usuario de holding se resuelve por acá.
+CREATE INDEX empresa_holding_idx ON empresa (holding_id);
 
 CREATE TRIGGER empresa_set_updated_at BEFORE UPDATE ON empresa
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -156,11 +179,39 @@ CREATE TRIGGER empresa_set_updated_at BEFORE UPDATE ON empresa
 -- inventar el mismo slug.
 -- =====================================================================
 
+-- Los tipos de consumo. Era un ENUM cerrado de cuatro valores, y pasa a tabla
+-- porque los tipos SI crecen: papel, residuos, viajes de negocio. Con un enum,
+-- agregar uno es una migracion (`ALTER TYPE ... ADD VALUE`) y quitarlo es
+-- imposible: el valor queda para siempre. Aqui es un INSERT y un DELETE.
+--
+-- El alcance (1/2/3) NO esta aqui a proposito: vive en `factor_emision`, por
+-- subcategoria, porque dos combustibles pueden tener alcances distintos (la
+-- lena no es el diesel). Una sola verdad, y en el lugar mas especifico.
+--
+-- Compartida entre clientes, como el resto de los catalogos.
+CREATE TABLE tipo_consumo (
+  id             text PRIMARY KEY,               -- 'electricidad', 'combustible'
+  label          text NOT NULL,
+  unidad_default unidad_medida NOT NULL,
+  orden          smallint NOT NULL DEFAULT 100,  -- para listarlos siempre igual
+  activo         boolean NOT NULL DEFAULT true
+);
+
+-- Los cuatro de hoy. Son estructura, no dato de un cliente, asi que van en el
+-- esquema y no en el volcado. `refrigerantes` esta porque la base SI lo acepta
+-- en registro_consumo; que el front no lo ofrezca como configurable es otra
+-- decision, anotada en lib/domain/sucursales.js.
+INSERT INTO tipo_consumo (id, label, unidad_default, orden) VALUES
+  ('electricidad',  'Electricidad',  'kWh', 10),
+  ('combustible',   'Combustible',   'L',   20),
+  ('agua',          'Agua',          'm3',  30),
+  ('refrigerantes', 'Refrigerantes', 'kg',  40);
+
 CREATE TABLE proveedor (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   slug          text NOT NULL,
   nombre        text NOT NULL,
-  tipo_consumo  tipo_consumo NOT NULL,
+  tipo_consumo  text NOT NULL REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   CONSTRAINT proveedor_tipo_slug_key UNIQUE (tipo_consumo, slug)
 );
 
@@ -169,7 +220,7 @@ CREATE TABLE proveedor (
 -- emoji y a las heurísticas de texto (combSubcatFromLabel).
 CREATE TABLE subcategoria (
   id             text PRIMARY KEY,        -- 'diesel', 'potable', 'otro:aceite-usado'
-  tipo_consumo   tipo_consumo NOT NULL,
+  tipo_consumo   text NOT NULL REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   label          text NOT NULL,
   origen         subcategoria_origen NOT NULL DEFAULT 'predef',
   unidad_default unidad_medida NOT NULL,
@@ -197,7 +248,7 @@ CREATE TABLE factor_emision (
   label           text NOT NULL,
   unidad          text NOT NULL,        -- 'kgCO₂e/kWh', 'kgCO₂e/L', …
   alcance         smallint NOT NULL CHECK (alcance IN (1, 2, 3)),
-  tipo_consumo    tipo_consumo NOT NULL,
+  tipo_consumo    text NOT NULL REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   subcategoria_id text REFERENCES subcategoria (id) ON DELETE SET NULL,
   fuente          text NOT NULL         -- 'IPCC 2006 · Huella Chile'
 );
@@ -220,6 +271,10 @@ CREATE TABLE sucursal (
   nombre      text NOT NULL,
   direccion   text,
   activa      boolean NOT NULL DEFAULT true,
+  -- La sucursal en RECYLINK: ellos ya la modelan. Sin esta columna las dos
+  -- tablas no se pueden emparejar, y el alcance a nivel sucursal no se puede
+  -- traducir desde el login. Sin FK hasta conocer esa tabla.
+  recylink_sucursal_id uuid,
   legacy_id   text,                      -- `Sucursal ID` de la planilla
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -229,6 +284,8 @@ CREATE TABLE sucursal (
   -- Por empresa: dos clientes migrados de planillas distintas pueden traer
   -- el mismo `Sucursal ID`.
   CONSTRAINT sucursal_legacy_id_key      UNIQUE (empresa_id, legacy_id),
+  -- Global, no por empresa: del lado de RECYLINK ese id ya es único.
+  CONSTRAINT sucursal_recylink_key        UNIQUE (recylink_sucursal_id),
   -- Redundante con la PK, y necesaria: es el destino de las FK compuestas
   -- de todas las tablas que cuelgan de una sucursal.
   CONSTRAINT sucursal_empresa_id_key     UNIQUE (empresa_id, id)
@@ -247,7 +304,7 @@ CREATE TABLE sucursal_subcategoria (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   empresa_id        uuid NOT NULL,
   sucursal_id       uuid NOT NULL,
-  tipo_consumo      tipo_consumo NOT NULL,
+  tipo_consumo      text NOT NULL REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   subcategoria_id   text REFERENCES subcategoria (id) ON DELETE RESTRICT,
   proveedor_id      uuid REFERENCES proveedor (id) ON DELETE SET NULL,
   unidad            unidad_medida,
@@ -310,7 +367,7 @@ CREATE TABLE drive_carpeta (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   empresa_id    uuid NOT NULL REFERENCES empresa (id) ON DELETE CASCADE,
   rol           drive_carpeta_rol NOT NULL,
-  tipo_consumo  tipo_consumo,
+  tipo_consumo  text REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   proveedor_id  uuid REFERENCES proveedor (id) ON DELETE CASCADE,
   folder_id     text NOT NULL,
   CONSTRAINT drive_carpeta_discriminante_chk CHECK (
@@ -335,20 +392,41 @@ CREATE UNIQUE INDEX drive_carpeta_rol_proveedor_key
   WHERE proveedor_id IS NOT NULL;
 
 -- =====================================================================
--- 5. Registros de consumo
+-- 5. Registros de consumo — LA tabla
 --    Una tabla en vez de tres hojas (Combustible / Electricidad / Agua),
---    que es lo que la app ya hacía al leer (readRecords).
+--    que es lo que la app ya hacía al leer (readRecords), MÁS los
+--    refrigerantes, que en la planilla vivían en la hoja `Emisiones`.
+--
+--    Los cuatro tipos conviven aquí y las columnas que no aplican a un tipo
+--    quedan NULL: `refrigerante_gas_id` solo lo usan los refrigerantes,
+--    `num_cliente` solo electricidad y agua. Es la decisión explícita de
+--    homologar; el precio es una tabla ancha con huecos, y el beneficio es
+--    que "todo el consumo de esta sucursal" es UNA consulta.
+--
+--    Lo que NO entra: las lecturas de medidor. Un medidor no marca consumo,
+--    marca un acumulado — como el cuentakilómetros de un auto. El consumo del
+--    mes es la resta entre dos lecturas, así que viven en su propia tabla
+--    (sección 6) y el consumo se deriva.
 -- =====================================================================
 
 CREATE TABLE registro_consumo (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   empresa_id      uuid NOT NULL REFERENCES empresa (id) ON DELETE CASCADE,
   sucursal_id     uuid NOT NULL,
-  tipo_consumo    tipo_consumo NOT NULL,
+  tipo_consumo    text NOT NULL REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   subcategoria_id text REFERENCES subcategoria (id) ON DELETE RESTRICT,
   proveedor_id    uuid REFERENCES proveedor (id) ON DELETE SET NULL,
   num_cliente     text,
+  -- Solo refrigerantes. Reemplaza a la tabla refrigerante_carga.
+  refrigerante_gas_id text REFERENCES refrigerante_gas (id) ON DELETE RESTRICT,
   fecha           date NOT NULL,
+  -- El eje de tiempo es `fecha`; el mes se deriva y no puede desincronizarse.
+  -- Lo natural sería to_char(fecha,'YYYY-MM'), pero to_char es STABLE y una
+  -- columna generada exige IMMUTABLE. extract + lpad sí lo son.
+  periodo         periodo_mes GENERATED ALWAYS AS (
+                    lpad(extract(year  from fecha)::text, 4, '0') || '-' ||
+                    lpad(extract(month from fecha)::text, 2, '0')
+                  ) STORED,
   -- Deuda 6: NULL = ilegible o no informado. 0 es un cero de verdad.
   consumo         numeric(14, 3) CHECK (consumo >= 0),
   unidad          unidad_medida NOT NULL,   -- deuda 5: se guarda
@@ -372,9 +450,11 @@ CREATE TABLE registro_consumo (
   CONSTRAINT registro_consumo_archivo_fkey
     FOREIGN KEY (empresa_id, archivo_id) REFERENCES archivo_drive (empresa_id, id)
     ON DELETE RESTRICT,
-  -- refrigerantes no tiene hoja de registros y sigue sin tenerla acá.
-  CONSTRAINT registro_consumo_tipo_chk
-    CHECK (tipo_consumo <> 'refrigerantes')
+  -- El gas y su tipo se atan en las dos direcciones: un refrigerante sin gas
+  -- no es un dato completo, y un gas en una fila de agua es un error.
+  CONSTRAINT registro_consumo_refrigerante_chk CHECK (
+    (tipo_consumo = 'refrigerantes') = (refrigerante_gas_id IS NOT NULL)
+  )
 );
 
 -- Lectura principal del dashboard: sucursal × tipo × rango de fechas,
@@ -388,6 +468,18 @@ CREATE INDEX registro_consumo_subcategoria_idx ON registro_consumo (subcategoria
 CREATE INDEX registro_consumo_proveedor_idx    ON registro_consumo (proveedor_id);
 CREATE INDEX registro_consumo_archivo_idx      ON registro_consumo (archivo_id);
 CREATE INDEX registro_consumo_origen_idx       ON registro_consumo (origen);
+CREATE INDEX registro_consumo_refrigerante_idx  ON registro_consumo (refrigerante_gas_id);
+
+-- Doble conteo: llega UNA boleta por número de cliente por mes, así que dos
+-- filas iguales son un error, no un dato. El candado va solo para
+-- electricidad y agua: combustible se registra POR COMPRA y varias cargas en
+-- el mismo mes son legítimas — un UNIQUE mensual lo rompería.
+-- `estado = 'activa'` deja volver a registrar después de un borrado lógico.
+CREATE UNIQUE INDEX registro_consumo_boleta_mes_key
+  ON registro_consumo (sucursal_id, tipo_consumo, num_cliente, periodo)
+  WHERE tipo_consumo IN ('electricidad', 'agua')
+    AND num_cliente IS NOT NULL
+    AND estado = 'activa';
 
 CREATE TRIGGER registro_consumo_set_updated_at BEFORE UPDATE ON registro_consumo
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -400,7 +492,7 @@ CREATE TABLE medidor (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   empresa_id   uuid NOT NULL,
   sucursal_id  uuid NOT NULL,
-  tipo_consumo tipo_consumo NOT NULL,
+  tipo_consumo text NOT NULL REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   nombre       text NOT NULL,
   numero       text,
   activo       boolean NOT NULL DEFAULT true,
@@ -472,7 +564,7 @@ CREATE TABLE precio_periodo (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   empresa_id   uuid NOT NULL,
   sucursal_id  uuid NOT NULL,
-  tipo_consumo tipo_consumo NOT NULL,
+  tipo_consumo text NOT NULL REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   periodo      periodo_mes NOT NULL,
   precio       numeric(14, 4) NOT NULL CHECK (precio >= 0),
   created_at   timestamptz NOT NULL DEFAULT now(),
@@ -489,7 +581,9 @@ CREATE TRIGGER precio_periodo_set_updated_at BEFORE UPDATE ON precio_periodo
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- =====================================================================
--- 7. Emisiones — la hoja de 7 columnas con `Scope` se parte en cinco tablas
+-- 7. Emisiones — la hoja de 7 columnas con `Scope` se reparte:
+--    los factores y las metas en cuatro tablas de aquí, y las cargas de
+--    refrigerante en registro_consumo (sección 5).
 -- =====================================================================
 
 CREATE TABLE factor_emision_empresa (
@@ -525,30 +619,10 @@ CREATE TRIGGER factor_emision_sucursal_set_updated_at
   BEFORE UPDATE ON factor_emision_sucursal
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
--- Cargas de refrigerante. El `uid` de la planilla no era estable entre
--- guardados; acá la PK es de la base y el reemplazo por grupo deja de
--- ser necesario.
-CREATE TABLE refrigerante_carga (
-  id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  empresa_id          uuid NOT NULL,
-  sucursal_id         uuid NOT NULL,
-  refrigerante_gas_id text NOT NULL REFERENCES refrigerante_gas (id) ON DELETE RESTRICT,
-  periodo             periodo_mes NOT NULL,
-  carga_kg            numeric(12, 3) NOT NULL CHECK (carga_kg >= 0),
-  created_at          timestamptz NOT NULL DEFAULT now(),
-  updated_at          timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT refrigerante_carga_sucursal_fkey
-    FOREIGN KEY (empresa_id, sucursal_id) REFERENCES sucursal (empresa_id, id)
-    ON DELETE CASCADE
-);
-
-CREATE INDEX refrigerante_carga_sucursal_periodo_idx
-  ON refrigerante_carga (sucursal_id, periodo);
-CREATE INDEX refrigerante_carga_gas_idx ON refrigerante_carga (refrigerante_gas_id);
-
-CREATE TRIGGER refrigerante_carga_set_updated_at
-  BEFORE UPDATE ON refrigerante_carga
-  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- Las cargas de refrigerante NO tienen tabla propia: son filas de
+-- registro_consumo con tipo_consumo = 'refrigerantes', unidad = 'kg' y
+-- refrigerante_gas_id puesto (sección 5). El `uid` inestable de la planilla
+-- desaparece con eso, y el reemplazo por grupo deja de ser necesario.
 
 -- META_FIELDS deja de ser key/value: cinco columnas, una fila por entidad.
 CREATE TABLE meta_empresa (
@@ -590,7 +664,7 @@ CREATE TABLE foto (
   empresa_id        uuid NOT NULL REFERENCES empresa (id) ON DELETE CASCADE,
   archivo_id        uuid NOT NULL,
   sucursal_id       uuid,
-  tipo_consumo      tipo_consumo,
+  tipo_consumo      text REFERENCES tipo_consumo (id) ON DELETE RESTRICT,
   subcategoria_id   text REFERENCES subcategoria (id) ON DELETE SET NULL,
   periodo           periodo_mes,
   status            foto_status NOT NULL DEFAULT 'pendiente',
@@ -659,59 +733,14 @@ CREATE TRIGGER app_config_set_updated_at BEFORE UPDATE ON app_config
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- =====================================================================
--- 10. Aislamiento entre clientes (RLS)
+-- 10. Aislamiento entre clientes (RLS) → ESQUEMA-POSTGRES-RLS.sql
 --
 -- Todo lo de arriba hace que el aislamiento sea POSIBLE: cada tabla de datos
--- sabe de qué empresa es, y las FK compuestas impiden mezclarlas. Esta
--- sección lo hace EFECTIVO.
+-- sabe de qué empresa es, y las FK compuestas impiden mezclarlas. Hacerlo
+-- EFECTIVO es el otro archivo, y va en un archivo aparte por dos razones:
 --
--- El `empresa_id` de la sesión se pone al tomar la conexión, una vez, con el
--- valor que salga del login de RECYLINK:
---
---   SET LOCAL app.empresa_id = '<uuid de la empresa>';
---
--- `SET LOCAL` y no `SET`: dura la transacción, así que una conexión reusada
--- de un pool no se lleva el tenant de la request anterior. Eso, en un pool,
--- es la diferencia entre aislar y filtrar datos de otro cliente.
---
--- Las políticas usan USING y WITH CHECK: la primera filtra lo que se lee y
--- se borra, la segunda valida lo que se inserta y actualiza. Sin WITH CHECK
--- se puede escribir una fila con el `empresa_id` de otro y después no verla.
---
--- SI RECYLINK NO USA RLS: esta sección entera se omite y el filtro pasa a la
--- capa de datos. En ese caso el requisito es que UNA función construya toda
--- consulta con su `WHERE empresa_id = $1` — nunca cada consulta por su
--- cuenta, porque la que se olvide no falla, devuelve datos de otro cliente.
---
--- Las tablas de catálogo (subcategoria, proveedor, factor_emision,
--- refrigerante_gas y subcategoria_unidad) NO llevan RLS: son compartidas.
+-- 1. Se aplica DESPUÉS de cargar los datos. Con RLS activo y sin alcance
+--    puesto, la propia carga no vería nada.
+-- 2. Mientras estuvo aquí comentado, nunca se compiló. Como archivo propio,
+--    `npm run db:check` lo ejecuta de verdad en cada corrida.
 -- =====================================================================
-
--- Descomentar para activar. Va después de cargar los datos: con RLS activo y
--- sin `app.empresa_id` puesto, la propia carga no vería nada.
---
--- CREATE FUNCTION empresa_actual() RETURNS uuid AS $$
---   SELECT nullif(current_setting('app.empresa_id', true), '')::uuid;
--- $$ LANGUAGE sql STABLE;
---
--- DO $$
--- DECLARE t text;
--- BEGIN
---   FOREACH t IN ARRAY ARRAY[
---     'sucursal', 'sucursal_subcategoria', 'archivo_drive', 'drive_carpeta',
---     'registro_consumo', 'medidor', 'lectura_medidor', 'lectura_adjunto',
---     'precio_periodo', 'factor_emision_empresa', 'factor_emision_sucursal',
---     'refrigerante_carga', 'meta_empresa', 'meta_sucursal', 'foto',
---     'foto_notif_email', 'app_config'
---   ] LOOP
---     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
---     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
---     EXECUTE format(
---       'CREATE POLICY %I ON %I USING (empresa_id = empresa_actual()) '
---       'WITH CHECK (empresa_id = empresa_actual())', t || '_tenant', t);
---   END LOOP;
--- END $$;
---
--- `FORCE ROW LEVEL SECURITY` incluye al dueño de las tablas. Sin eso, el rol
--- que corre las migraciones —que suele ser el mismo de la app— se salta las
--- políticas y el aislamiento existe solo en el papel.

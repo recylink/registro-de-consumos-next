@@ -3,7 +3,7 @@
 import { revalidateTag } from "next/cache";
 import { TAGS } from "@/lib/apps-script";
 import { run } from "@/lib/result";
-import { completeFoto, notifyFotoPending, uploadFoto } from "@/lib/sheets/fotos";
+import { completeFoto, notifyFotoPending, uploadFoto } from "@/lib/backend";
 
 /**
  * Sube una foto de boleta y deja la fila pendiente de completar. El aviso por
@@ -32,9 +32,9 @@ export async function uploadFotoAction(formData) {
  * archiva el archivo en Drive. Invalida también los registros porque la fila
  * nueva tiene que aparecer en el dashboard.
  */
-export async function completeFotoAction({ rowIndex, fotoRow, patch }) {
+export async function completeFotoAction({ id, fotoRow, patch }) {
   return run(async () => {
-    await completeFoto({ rowIndex, fotoRow, patch });
+    await completeFoto({ id, fotoRow, patch });
     revalidateTag(TAGS.fotos);
     revalidateTag(TAGS.records);
     return {};

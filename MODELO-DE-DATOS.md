@@ -423,19 +423,59 @@ firmada (`lib/auth/acceso.js`); ninguna fila registra quién la escribió. El ca
 
 ## Hacia PostgreSQL
 
-Dos archivos, escritos a partir de este documento y del código que cita:
+Tres archivos, escritos a partir de este documento y del código que cita:
 
 | Archivo | Qué es |
 |---------|--------|
-| `ESQUEMA-POSTGRES.sql` | El esquema relacional: PKs, FKs, enums, CHECKs e índices |
+| `ESQUEMA-POSTGRES.sql` | El esquema relacional: PKs, FKs, catálogos, CHECKs e índices |
+| `ESQUEMA-POSTGRES-RLS.sql` | El aislamiento entre clientes. Se aplica DESPUÉS de cargar los datos |
 | `app/api/migracion/postgres/route.js` | Volcado de la planilla a ese esquema. No escribe: emite SQL |
 
 ```sh
+npm run db:check                                   # arma el esquema en PGlite y prueba el alcance
 curl -s 'localhost:3000/api/migracion/postgres?informe=si' | jq   # qué NO se migra y por qué
 curl -s localhost:3000/api/migracion/postgres > carga.sql
+npm run db:check carga.sql                         # esquema + datos + RLS, todo junto
+```
+
+`npm run db:check` corre el esquema en un Postgres de verdad —PGlite, que es
+Postgres compilado a WebAssembly— sin necesidad de `psql` ni de docker. No es un
+extra: hasta que existió, el esquema estaba escrito pero **nunca se había
+ejecutado**, y el primer intento falló en la primera línea. Además de compilar el
+DDL, comprueba el alcance entre clientes con datos de prueba, que es lo único que
+distingue "las políticas se crearon" de "las políticas aíslan".
+
+Contra el Postgres real de Supabase, en un esquema desechable que se borra al
+terminar (la base queda como estaba):
+
+```sh
+npm run db:supabase                  # arma, prueba y borra
+npm run db:supabase carga.sql        # además carga el volcado
+npm run db:supabase -- --conservar   # no borra, para poder mirar
+```
+
+Y para instalarlo de verdad en `public`, que no se borra:
+
+```sh
+npm run db:instalar                  # solo las tablas
+npm run db:instalar carga.sql        # tablas + datos
+```
+
+`db:instalar` se niega a correr si `public` ya tiene alguna de estas tablas, y
+mete todo en una sola transacción: si algo falla a mitad de camino, la base no
+cambia. Necesita `DATABASE_URL` en `.env.local`, con la cadena del **pooler en
+modo Session** (puerto 5432): la conexión directa de Supabase
+(`db.<ref>.supabase.co`) solo existe en IPv6.
+
+O con `psql`, si algún día está instalado:
+
+```sh
 psql "$DATABASE_URL" -f ESQUEMA-POSTGRES.sql
 psql "$DATABASE_URL" -1 -f carga.sql
+psql "$DATABASE_URL" -f ESQUEMA-POSTGRES-RLS.sql    # al final: con RLS activo, la carga no vería nada
 ```
+
+### La jerarquía y el alcance
 
 El destino es un **módulo del SaaS RECYLINK**: los usuarios entran por la
 plataforma y cada cliente ve solo su versión de la herramienta. Eso cambia algo
@@ -444,22 +484,176 @@ de fondo respecto de hoy, y no es solo una columna más:
 - Hoy `EMPRESA` es una **constante del deploy** (`lib/instance.js`, `"NEXT"`) y
   cada cliente tiene su instancia y su planilla. En RECYLINK es una **fila**, y
   las de todos los clientes conviven en la misma base.
-- Por eso toda tabla de datos lleva `empresa_id` —incluso las que podrían
-  deducirlo por FK— y las FK son **compuestas**: `medidor` referencia
-  `(empresa_id, sucursal_id)`. Así la base rechaza un medidor cuya empresa no
-  sea la de su sucursal, en vez de confiar en que la app no se equivoque.
+- La jerarquía es **holding → empresa → sucursal**, la misma que ya tiene
+  RECYLINK, y un usuario está en **un** nivel. Las tres tablas son proyección
+  local de las suyas: cada una lleva un `recylink_*_id` sin FK todavía. Cuando se
+  conozca la tabla del otro lado es una línea por columna.
+- Por eso el aislamiento no fija "el tenant" sino un **alcance**: un usuario de
+  holding ve varias empresas a la vez. Son dos ajustes de sesión,
+  `app.empresa_ids` y `app.sucursal_ids`, y `sucursal_ids` vacío significa "todas
+  las del alcance de empresa". Es la traducción exacta de lo que pide la UI:
+  filtro de empresa cuando hay más de una, filtro de sucursal deshabilitado
+  cuando el alcance es global.
+- Sin alcance puesto **no se ve nada**: `x = ANY(NULL)` es NULL, y una política
+  que no da verdadero no deja pasar la fila. El default es cerrado.
+- Toda tabla de datos lleva `empresa_id` —incluso las que podrían deducirlo por
+  FK— y las FK son **compuestas**: `medidor` referencia `(empresa_id,
+  sucursal_id)`. Así la base rechaza un medidor cuya empresa no sea la de su
+  sucursal, en vez de confiar en que la app no se equivoque.
 - Las claves heredadas de la planilla (`legacy_id`) son únicas **por empresa**:
   dos clientes migrados de planillas distintas pueden traer el mismo `comb_...`.
-- El aislamiento efectivo es RLS con `app.empresa_id` (sección 10 del esquema,
-  comentada). Si RECYLINK no usa RLS, el filtro pasa a la capa de datos — y ahí
-  el requisito es que **una** función lo ponga siempre, porque la consulta que
-  se olvide no falla: devuelve datos de otro cliente.
+- Si RECYLINK no usa RLS, `ESQUEMA-POSTGRES-RLS.sql` no se aplica y el filtro
+  pasa a la capa de datos — y ahí el requisito es que **una** función lo ponga
+  siempre, porque la consulta que se olvide no falla: devuelve datos de otro
+  cliente.
 - Los catálogos (subcategorías, proveedores, factores, refrigerantes) quedan
   **compartidos** entre clientes. Es una decisión con una consecuencia anotada
   en la sección 2 del esquema: el slug de una subcategoría que cree un cliente
   es legible por los demás si alguna consulta lista el catálogo completo.
 
-Qué cambia al pasar, contra las "Deudas del modelo" de arriba:
+### Once hojas, once no
+
+Las tres hojas de consumo (`Combustible`, `Electricidad`, `Agua`) y las cargas de
+refrigerante de la hoja `Emisiones` son **una sola tabla**, `registro_consumo`.
+Las columnas que no aplican a un tipo quedan NULL: `refrigerante_gas_id` solo lo
+usan los refrigerantes, `num_cliente` solo electricidad y agua. El beneficio es
+que "todo el consumo de esta sucursal" pasa a ser UNA consulta.
+
+Lo que **no** entra son las lecturas de medidor. Un medidor no marca consumo,
+marca un acumulado: lo del mes es la resta entre dos lecturas. Siguen en
+`lectura_medidor` y el consumo se deriva.
+
+Y **los tipos de consumo son una tabla, no una lista cerrada.** Se eligió lista
+cerrada (un `ENUM`) el 2026-08-19 argumentando que los tipos no crecen, y ese
+mismo día quedó claro que sí crecen: papel, residuos, viajes de negocio. Con un
+`ENUM`, agregar un tipo es una migración (`ALTER TYPE ... ADD VALUE`) y quitarlo
+es imposible: el valor queda para siempre. Como tabla, agregar es un `INSERT`, y
+quitar un `DELETE` que la FK rechaza si el tipo está en uso.
+
+Esa tabla guarda la etiqueta, la unidad por defecto y el orden de despliegue. El
+**alcance** (1/2/3) no está ahí a propósito: vive en `factor_emision`, por
+subcategoría, porque la leña y el diésel son los dos combustible y no comparten
+alcance. Una sola verdad, en el lugar más específico.
+
+Lo que la tabla todavía **no** resuelve: el front sigue leyendo los tipos de
+cuatro listas en código, y agregar uno toca 19 archivos. Ese es el paso que baja
+de 19 a uno, y está pendiente. El mapa completo está en
+`PLAYBOOK-NUEVO-TIPO.md`.
+
+El eje de tiempo es `fecha`, y `periodo` (`YYYY-MM`) es una **columna generada**,
+así que no puede quedar desincronizada. Detalle que cuesta descubrir: lo natural
+sería `to_char(fecha,'YYYY-MM')`, pero `to_char` es `STABLE` y una columna
+generada exige `IMMUTABLE`; la expresión usa `extract` + `lpad`, que sí lo son.
+
+### El doble conteo
+
+Llega **una** boleta de luz o agua por número de cliente y por mes, así que dos
+filas activas con la misma clave son la misma boleta cargada dos veces. Eso lo
+impide un índice único parcial, `registro_consumo_boleta_mes_key`. Combustible
+queda fuera a propósito: **se registra por compra**, y varias cargas en el mismo
+mes son legítimas — un candado mensual lo rompería.
+
+La primera vez que se aplicó, ese índice rechazó datos reales de la planilla de
+prueba: dos filas de electricidad del cliente `113322-5`, 19-04-2025, 640 kWh y
+$144.348, cargadas desde dos documentos distintos. No era un falso positivo: hoy
+el dashboard las suma dos veces. El volcado ahora las detecta antes de emitir el
+SQL y las lista en `duplicados.registros` como `boleta repetida`, migrando una
+sola.
+
+### El interruptor: planilla o PostgreSQL
+
+`lib/backend.js` decide de dónde salen y a dónde van los datos. Un solo lugar, y
+todo lo demás importa de ahí:
+
+```sh
+DATOS_BACKEND=postgres npm run dev   # PostgreSQL
+npm run dev                          # la planilla, como siempre
+```
+
+Es una variable de **instancia**, no una bandera en la base, y la razón es
+concreta: hay varias versiones desplegadas del Registro de Consumos (NEXT, Ando,
+Obra Limpia…), cada una con su planilla y sus usuarios. Así NEXT pasa a
+PostgreSQL sin tocar a las demás, y volver atrás es cambiar una variable.
+
+**El cambio mueve las dos cosas a la vez, lecturas y escrituras.** No hay estado
+intermedio válido: leer de la base y escribir en la planilla significa registrar
+un consumo y no verlo aparecer.
+
+La capa nueva vive en `lib/db/`:
+
+| Archivo | Qué |
+|---------|-----|
+| `cliente.js` | El pool de conexiones, el id de la empresa y el ayudante de transacciones |
+| `lecturas.js` | Las seis lecturas, más las carpetas de Drive |
+| `escrituras.js` | Las once escrituras |
+
+Tres cosas cambian de fondo respecto de la planilla, y ninguna es cosmética:
+
+- **Las referencias son de verdad.** Una fila de consumo apunta a su sucursal por
+  id, no por nombre. Por eso `renameSucursalInRecords` **no hace nada** y
+  devuelve 0: renombrar una sucursal ya no obliga a reescribir su historial.
+- **Lo que tiene que pasar junto, pasa junto.** Guardar una sucursal son varias
+  escrituras y van en una transacción: un fallo a mitad no deja media
+  configuración.
+- **Borrar una sucursal es darle de baja.** Un DELETE real fallaría por la FK de
+  `registro_consumo`, que es RESTRICT a propósito: perder el historial de una
+  sucursal no puede ser el efecto de un clic.
+
+Y desapareció la última identidad por posición: las fotos se identificaban por su
+número de fila, incluso en la URL (`?fila=14`). Ahora es `?foto=<id>`, y la capa
+de planilla también expone un `id`, así que la pantalla no sabe cuál de los dos
+backends tiene detrás.
+
+### Comprobar que la capa nueva es un reemplazo
+
+Dos rutas de diagnóstico, y las dos importan:
+
+```sh
+# Lee lo mismo de las dos fuentes y exige que coincida
+curl -s localhost:3000/api/diagnostico/db-vs-sheets | jq
+
+# Escribe de verdad por el camino de la app, y borra lo que escribió
+curl -s -X POST localhost:3000/api/diagnostico/db-escritura | jq
+```
+
+La primera compara los nueve conjuntos de datos ignorando los ids (son distintos
+a propósito) y los campos de posición de fila. La segunda crea una sucursal,
+escribe un consumo, lo edita, renombra la sucursal, guarda destinatarios y
+**limpia todo**, incluso si algo falla.
+
+Contra la planilla de prueba, ocho de los nueve conjuntos coinciden literal. El
+noveno son dos diferencias decididas: la boleta duplicada que el volcado no migra,
+y un registro cuyo proveedor en la planilla es un guion (`—`), que en la base
+queda vacío porque un guion no es un proveedor.
+
+### Los permisos, en Supabase
+
+Supabase concede a `anon` y `authenticated` los siete privilegios sobre toda
+tabla nueva de `public`. Para este módulo eso sobra, y en dos puntos es un
+agujero que las políticas de aislamiento **no** tapan, así que
+`ESQUEMA-POSTGRES-RLS.sql` los recorta al final:
+
+- **`anon` pierde todo.** Es el rol de la llave pública, la que viaja al
+  navegador. Este módulo habla con la base por conexión directa, no por la API
+  REST de Supabase, así que cualquier permiso de `anon` es superficie regalada.
+  Sin ese recorte, los cinco catálogos —que no llevan RLS a propósito— quedan
+  legibles **y editables** con la llave pública, y ahí viven los factores de
+  emisión.
+- **`authenticated` pierde `TRUNCATE`** (y `TRIGGER` y `REFERENCES`). `TRUNCATE`
+  se salta RLS por diseño: no es "borrar las filas que puedo ver", es una
+  operación sobre la tabla entera. Un rol con `TRUNCATE` puede dejar
+  `registro_consumo` en cero por mucho que las políticas digan que solo ve su
+  empresa.
+
+Ese bloque va dentro de un `DO` que comprueba si los roles existen, para que el
+mismo archivo sirva en un Postgres pelado.
+
+Y una consecuencia para cuando se escriba `lib/db/`: **la aplicación no puede
+conectarse como `postgres`.** Ese rol tiene `BYPASSRLS`, así que el aislamiento
+entre clientes dejaría de existir sin que nada avise. Necesita su propio rol sin
+ese privilegio.
+
+### Qué cambia contra las "Deudas del modelo" de arriba
 
 - **La sucursal se referencia solo por FK.** El nombre pasa a ser un `UNIQUE`
   declarado, y renombrar deja de ser una migración de datos (deuda 1). La
@@ -479,9 +673,9 @@ Qué cambia al pasar, contra las "Deudas del modelo" de arriba:
   aporta el proyecto en el que esto se va a injertar.
 
 Lo que la planilla acepta y el esquema no —dos medidores con el mismo número en
-una sucursal, dos filas con el mismo `ID`, la misma foto dos veces— se omite del
-volcado y se lista en `duplicados`. Si se emitiera, el primer choque abortaría la
-transacción y no migraría nada.
+una sucursal, dos filas con el mismo `ID`, la misma foto dos veces, la misma
+boleta dos veces— se omite del volcado y se lista en `duplicados`. Si se
+emitiera, el primer choque abortaría la transacción y no migraría nada.
 
 ## Verificar este documento contra la planilla real
 

@@ -6,15 +6,18 @@ import { currentMonthKey } from "@/lib/domain/periods";
 
 export const metadata = { title: "Completar foto" };
 
-// Qué foto completar viene en la URL (?fila=N, el número de fila de la hoja).
+// Qué foto completar viene en la URL (?foto=<id>). Antes era ?fila=N, el número
+// de fila de la hoja: eso dejó de servir al pasar a PostgreSQL, donde una fila no
+// tiene posición. El id es texto y opaco a propósito.
 // En el prototipo era un campo del estado global, así que la pantalla no era
 // enlazable y un refresh la perdía.
 export default async function CompletarFotoPage({ searchParams }) {
-  const { fila } = await searchParams;
-  const rowIndex = parseInt(fila, 10);
+  const { foto, fila } = await searchParams;
+  // `fila` se sigue aceptando para no romper un enlace guardado de antes.
+  const id = String(foto ?? fila ?? "");
 
   const [fotos, sucursales] = await Promise.all([loadFotos(), loadSucursales()]);
-  const row = fotos.data.find((r) => r.rowIndex === rowIndex);
+  const row = fotos.data.find((r) => String(r.id) === id);
 
   if (!row) {
     return (

@@ -164,7 +164,7 @@ export async function GET(req) {
   // UNIQUE, así que existen; si se emitieran, el primer choque aborta la
   // transacción entera y no migra nada. Se omiten y se listan.
   const duplicados = { medidores: [], registros: [], fotos: [] };
-  const vistos = { medidores: new Set(), registros: new Set(), fotos: new Set() };
+  const vistos = { medidores: new Set(), registros: new Set(), fotos: new Set(), boletas: new Set() };
   const out = [];
   const w = (linea) => out.push(linea);
   const seccion = (titulo) => w(`\n-- ${"-".repeat(68)}\n-- ${titulo}\n-- ${"-".repeat(68)}\n`);
@@ -316,6 +316,20 @@ export async function GET(req) {
       continue;
     }
     vistos.registros.add(r.id);
+    // Llega UNA boleta por cliente y mes, asi que dos filas activas con la
+    // misma clave son la misma boleta cargada dos veces. El indice
+    // registro_consumo_boleta_mes_key las rechaza; se detectan aca para que la
+    // transaccion entre y quede la lista de cual hay que revisar. Combustible
+    // queda fuera a proposito: se registra por compra, no por mes.
+    const est = enumOf(r.estado, ["activa", "eliminada"]);
+    if ((r.type === "electricidad" || r.type === "agua") && r.numeroCliente && est === "'activa'") {
+      const claveBoleta = `${r.sucursal}|${r.type}|${r.numeroCliente}|${r.date.slice(0, 7)}`;
+      if (vistos.boletas.has(claveBoleta)) {
+        duplicados.registros.push(`${r.id} (boleta repetida: ${claveBoleta})`);
+        continue;
+      }
+      vistos.boletas.add(claveBoleta);
+    }
     nRegistros++;
     const refArch = r._driveLink ? archivo("", r._driveLink, "") : null;
     c(
@@ -323,7 +337,7 @@ export async function GET(req) {
         `${EMP}, ${refSuc}, '${r.type}', ${subcat(r.type, r.subcat)}, ` +
         `${proveedor(r.type, r.provider)}, ${q(r.numeroCliente)}, ${q(r.date)}, ` +
         `${n(r.cantidad)}, ${u}, ${n(r.costo)}, ` +
-        `${enumOf(r.estado, ["activa", "eliminada"])}, ` +
+        `${est}, ` +
         `${enumOf(r.origen, ["manual", "documento", "foto", "sheets"])}, ` +
         `${refArch || "NULL"}, ${q(r.id)});`,
     );
@@ -432,7 +446,10 @@ export async function GET(req) {
     );
   }
 
-  // ----- Emisiones: la hoja con la columna `Scope` se parte en cinco tablas ---
+  // ----- Emisiones: la hoja con la columna `Scope` se reparte -----------------
+  // Los factores y las metas en cuatro tablas; las cargas de refrigerante en
+  // registro_consumo, junto al resto de los consumos.
+  let nRefrigerantes = 0;
   const em = emissions || {
     factoresEmpresa: {},
     factoresSucursal: {},
@@ -467,9 +484,14 @@ export async function GET(req) {
     }
   }
 
+  // Las cargas de refrigerante ya no tienen tabla propia: son filas de
+  // registro_consumo con tipo 'refrigerantes', unidad 'kg' y su gas. La hoja
+  // guarda mes y no dia, asi que entran con dia 1 y `periodo` se deriva sola.
   const gasesValidos = new Set(REFRIGERANTES_CATALOG.map((g) => g.id));
-  c(`\n-- refrigerante_carga`);
+  c("");
+  c("-- refrigerantes -> registro_consumo (ya no hay tabla refrigerante_carga)");
   for (const [sucId, cargas] of Object.entries(em.refrigerantesSucursal || {})) {
+    let i = 0;
     for (const rf of cargas || []) {
       if (!gasesValidos.has(rf.tipo)) {
         avisos.push(`carga de refrigerante con gas "${rf.tipo}" fuera del catalogo: se omite`);
@@ -479,10 +501,16 @@ export async function GET(req) {
         avisos.push(`carga de ${rf.tipo} en ${sucId} con mes "${rf.mes}": se omite`);
         continue;
       }
+      // El `uid` de la planilla no es estable entre guardados, asi que la clave
+      // heredada se arma con lo que si lo es, mas la posicion en la hoja. Es lo
+      // que evita duplicarlas si el volcado se corre dos veces.
+      const legacy = `refrig_${sucId}_${rf.tipo}_${rf.mes}_${i++}`;
       c(
-        `INSERT INTO refrigerante_carga (empresa_id, sucursal_id, refrigerante_gas_id, periodo, carga_kg) VALUES (` +
-          `${EMP}, ${sucPorLegacy(sucId)}, ${q(rf.tipo)}, ${q(rf.mes)}, ${n(rf.cargaKg)});`,
+        `INSERT INTO registro_consumo (empresa_id, sucursal_id, tipo_consumo, refrigerante_gas_id, fecha, consumo, unidad, estado, origen, legacy_id) VALUES (` +
+          `${EMP}, ${sucPorLegacy(sucId)}, 'refrigerantes', ${q(rf.tipo)}, ${q(rf.mes + "-01")}, ` +
+          `${n(rf.cargaKg)}, 'kg', 'activa', 'sheets', ${q(legacy)});`,
       );
+      nRefrigerantes++;
     }
   }
 
@@ -638,8 +666,14 @@ export async function GET(req) {
     `INSERT INTO empresa (codigo, nombre) VALUES (${q(EMPRESA)}, ${q(EMPRESA)}) ` +
       `ON CONFLICT (codigo) DO NOTHING;`,
   );
-  w(`-- Falta ligarla al cliente de RECYLINK, que este código no conoce:`);
-  w(`--   UPDATE empresa SET recylink_tenant_id = '<uuid>' WHERE codigo = ${q(EMPRESA)};`);
+  w(`-- holding_id queda NULL: la planilla no tiene noción de holding, y una`);
+  w(`-- empresa suelta es válida. Lo pone la sincronización con RECYLINK.`);
+  w(`-- Falta ligarla a la jerarquía de RECYLINK, que este código no conoce:`);
+  w(`--   UPDATE empresa SET recylink_empresa_id = '<uuid>' WHERE codigo = ${q(EMPRESA)};`);
+  w(`--   UPDATE empresa SET holding_id = '<uuid del holding>' WHERE codigo = ${q(EMPRESA)};`);
+  w(`-- Y por cada sucursal, su id del otro lado, que es lo que traduce el`);
+  w(`-- alcance a nivel sucursal desde el login:`);
+  w(`--   UPDATE sucursal SET recylink_sucursal_id = '<uuid>' WHERE legacy_id = '<Sucursal ID>';`);
 
   seccion("Catalogos (hoy en lib/domain/, aca filas)");
   for (const [id, s] of subcats) {
@@ -711,6 +745,7 @@ export async function GET(req) {
       adjuntos: nAdjuntos,
       precios: medidores.prices.length,
       fotos: fotos.length,
+      refrigerantes: nRefrigerantes,
       archivosDrive: archivos.size,
       subcategorias: subcats.size,
       proveedores: proveedores.size,
@@ -730,6 +765,7 @@ export async function GET(req) {
       "creado_por / completada_por quedan NULL: la planilla no registra autoria.",
       "Un consumo 0 puede haber sido un valor ilegible (toNumber). Contrastar con /api/migracion/lectura-cruda.",
       "Los duplicados listados NO se migran: la planilla los acepta y el esquema no. Decidir cual queda antes de dar la carga por completa.",
+      "Una 'boleta repetida' es la misma boleta de luz o agua cargada dos veces (mismo cliente, mismo mes): hoy el dashboard suma las dos. Se migra una sola.",
     ],
   };
 

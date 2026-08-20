@@ -7,16 +7,25 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "eslint .",
+    "db:check": "node scripts/verificar-esquema.mjs",
+    "db:supabase": "node --env-file=.env.local scripts/probar-en-supabase.mjs",
+    "db:instalar": "node --env-file=.env.local scripts/instalar-en-supabase.mjs",
     "test": "node --experimental-test-module-mocks --no-warnings --import ./test/registrar.mjs --test test/*.test.mjs"
   },
   "dependencies": {
     "googleapis": "^174.0.0",
     "next": "^16.2.12",
     "pdfjs-dist": "^6.2.108",
+    "pg": "^8.23.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "server-only": "^0.0.1",
     "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.5",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.3.1"
   }
 }
